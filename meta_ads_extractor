@@ -1,0 +1,206 @@
+# We start with the extraction of the meta ads using meta Graph API
+
+ACCESS_TOKEN = "Acces_token"
+
+AD_ACCOUNT_ID = "act_123456789"
+
+# API Version
+META_API_VERSION = "v24.0"
+BASE_URL = f"https://graph.facebook.com/{META_API_VERSION}"
+
+RATE_LIMIT_DELAY = 0.5  
+MAX_RETRIES = 3         
+
+ = [
+    "campaign_id",
+    "campaign_name",
+    "impressions",
+    "clicks",
+    "spend",
+    "date_start",
+    "date_stop",
+]
+
+
+class MetaAdsExtractor:
+    """
+    Extrae insights de campañas de una cuenta publicitaria de Meta.
+    """
+
+    def __init__(self, access_token: str, ad_account_id: str):
+        # Normalizar ID de cuenta
+        if not ad_account_id.startswith("act_"):
+            ad_account_id = f"act_{ad_account_id}"
+
+        self.access_token = access_token
+        self.ad_account_id = ad_account_id
+        self.base_url = f"{BASE_URL}/{self.ad_account_id}"
+        self.data = []
+
+    def _make_request(
+        self,
+        endpoint: str,
+        params: Dict,
+        retry_count: int = 0
+    ) -> Optional[Dict]:
+        """
+        Llamada GET a la API con manejo de errores y reintentos.
+        """
+        try:
+            time.sleep(RATE_LIMIT_DELAY)
+            response = requests.get(endpoint, params=params, timeout=30)
+
+            if response.status_code == 200:
+                return response.json()
+
+            # Rate limit
+            if response.status_code == 429:
+                print("⚠️  Rate limit. Esperando 60 segundos...")
+                time.sleep(60)
+                if retry_count < MAX_RETRIES:
+                    return self._make_request(endpoint, params, retry_count + 1)
+
+            # Token inválido o permisos
+            if response.status_code in (400, 401, 403):
+                print(f"❌ Error {response.status_code}: {response.text}")
+                return None
+
+            # Otros errores
+            print(f"❌ Error {response.status_code}: {response.text}")
+            if retry_count < MAX_RETRIES:
+                time.sleep(5)
+                return self._make_request(endpoint, params, retry_count + 1)
+
+        except requests.exceptions.Timeout:
+            print("⚠️  Timeout. Reintentando...")
+            if retry_count < MAX_RETRIES:
+                return self._make_request(endpoint, params, retry_count + 1)
+
+        except Exception as e:
+            print(f"❌ Excepción: {str(e)}")
+            return None
+
+        return None
+
+    def extract_insights(self) -> pd.DataFrame:
+        """
+        Extrae insights diarios de los óltimos 90 días de la cuenta.
+        """
+        print("=" * 80)
+        print("📊 EXTRAYENDO DATOS DE META MARKETING API")
+        print("=" * 80)
+        print(f"📅 Período: last_90d")
+        print(f"🔑 Cuenta: {self.ad_account_id}")
+
+        endpoint = f"{self.base_url}/insights"
+
+        params = {
+            "access_token": self.access_token,
+            "fields": ",".join(FIELDS),
+            "date_preset": "last_90d",
+            "time_increment": 1,
+            "limit": 1000,
+        }
+
+        print("\n🔄 Iniciando extracción...")
+        all_rows = []
+
+        while True:
+            resp = self._make_request(endpoint, params)
+            if resp is None or "data" not in resp:
+                print("❌ No se pudieron extraer datos. Verifica token y cuenta.")
+                break
+
+            batch = resp.get("data", [])
+            all_rows.extend(batch)
+            print(f"   ✓ {len(batch)} registros descargados (acumulado {len(all_rows)})")
+
+            # Paginación
+            paging = resp.get("paging", {})
+            next_url = paging.get("next")
+            if not next_url:
+                break
+
+            endpoint = next_url
+            params = {}  # ya vienen en la URL de next
+
+        if not all_rows:
+            print("⚠️  Sin datos")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        df = self._clean_data(df)
+        print(f"\n✅ Datos limpios: {df.shape[0]} filas × {df.shape[1]} columnas")
+        return df
+
+    def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Limpieza básica y conversión de tipos.
+        """
+        # Convertir números
+        for col in ["impressions", "clicks", "spend"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Fechas
+        if "date_start" in df.columns:
+            df["date_start"] = pd.to_datetime(df["date_start"])
+        if "date_stop" in df.columns:
+            df["date_stop"] = pd.to_datetime(df["date_stop"])
+
+        # Rellenar nulos
+        df = df.fillna(0)
+
+        # Métricas derivadas ótiles
+        df["CTR_%"] = np.where(
+            df["impressions"] > 0,
+            (df["clicks"] / df["impressions"]) * 100,
+            0,
+        ).round(2)
+
+        df["CPC"] = np.where(
+            df["clicks"] > 0,
+            df["spend"] / df["clicks"],
+            0,
+        ).round(2)
+
+        df["CPM"] = np.where(
+            df["impressions"] > 0,
+            (df["spend"] / df["impressions"]) * 1000,
+            0,
+        ).round(2)
+
+        return df
+
+    def save(self, df: pd.DataFrame, filename: str) -> None:
+        """
+        Guardar DataFrame a CSV.
+        """
+        df.to_csv(filename, index=False)
+        print(f"✅ Archivo guardado: {filename}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    if "TU_TOKEN_NUEVO_AQUI" in ACCESS_TOKEN:
+        print("\n❌ CONFIGURA ACCESS_TOKEN antes de ejecutar el script.\n")
+        return
+
+    extractor = MetaAdsExtractor(ACCESS_TOKEN, AD_ACCOUNT_ID)
+    df = extractor.extract_insights()
+
+    if not df.empty:
+        extractor.save(df, "meta_ads_campaigns.csv")
+        print("\n✅ Extracción completada exitosamente\n")
+    else:
+        print("\n⚠️  No se generó archivo porque no hubo datos.\n")
+
+
+if __name__ == "__main__":
+    main()
+
+    from google.colab import files
+files.download('meta_ads_analytics.csv')
